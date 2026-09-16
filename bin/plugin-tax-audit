@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Automates the manual "unload it and compare top -bn2 before/after" test
+# that originally caught the omalava CPU leak — run once across every
+# enabled third-party plugin instead of one at a time by hand.
+#
+# For each enabled, third-party, non-"bar"-kind plugin: sample shell
+# CPU/RSS, disable the plugin, let the shell settle, sample again, then
+# re-enable it. First-party plugins and full-bar replacements are left
+# alone in this v1 — toggling the active bar or a core Omarchy feature is a
+# different, worse kind of disruptive than blinking a third-party widget.
+#
+# Disruptive by design (each plugin blinks off for a few seconds) — meant
+# to be run on demand from the Plugin Tax panel, not on a timer. Always
+# re-enables anything it disabled, even on failure or interrupt.
+#
+# Usage: plugin-tax-audit [sample_interval_seconds]
+#   Prints one JSON array to stdout, sorted by deltaPct descending:
+#     [{"id":..,"name":..,"beforePct":F,"afterPct":F,"deltaPct":F,
+#       "beforeRssKb":N,"afterRssKb":N,"deltaRssKb":N}, ...]
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+sampler="$here/plugin-tax-sample"
+interval="${1:-1.5}"
+settle="1.5"
+
+command -v jq >/dev/null 2>&1 || { echo '[]'; exit 0; }
+command -v omarchy >/dev/null 2>&1 || { echo '[]'; exit 0; }
+
+declare -a disabled_by_us=()
+
+cleanup() {
+  local id
+  for id in "${disabled_by_us[@]:-}"; do
+    [[ -n "$id" ]] && omarchy plugin enable "$id" >/dev/null 2>&1
+  done
+}
+trap cleanup EXIT INT TERM
+
+plugins_json="$(omarchy plugin list --json 2>/dev/null)"
+[[ -n "$plugins_json" ]] || plugins_json="[]"
+
+mapfile -t ids < <(jq -r '
+  .[] | select(.firstParty == false and .enabled == true)
+      | select((.kinds // []) | index("bar") | not)
+      | .id
+' <<<"$plugins_json" 2>/dev/null)
+
+results="[]"
+
+for id in "${ids[@]:-}"; do
+  [[ -n "$id" ]] || continue
+  name="$(jq -r --arg id "$id" '.[] | select(.id == $id) | (.name // $id)' <<<"$plugins_json" 2>/dev/null)"
+  [[ -n "$name" ]] || name="$id"
+
+  before="$("$sampler" "$interval")"
+  before_pct="$(jq -r '.cpuPct // empty' <<<"$before" 2>/dev/null)"
+  before_rss="$(jq -r '.rssKb // empty' <<<"$before" 2>/dev/null)"
+  [[ -n "$before_pct" ]] || continue
+
+  omarchy plugin disable "$id" >/dev/null 2>&1 || continue
+  disabled_by_us+=("$id")
+  sleep "$settle"
+
+  after="$("$sampler" "$interval")"
+  after_pct="$(jq -r '.cpuPct // empty' <<<"$after" 2>/dev/null)"
+  after_rss="$(jq -r '.rssKb // empty' <<<"$after" 2>/dev/null)"
+
+  omarchy plugin enable "$id" >/dev/null 2>&1
+  for i in "${!disabled_by_us[@]}"; do
+    [[ "${disabled_by_us[$i]}" == "$id" ]] && unset 'disabled_by_us[i]'
+  done
+  sleep 1
+
+  [[ -n "$after_pct" && -n "$before_rss" && -n "$after_rss" ]] || continue
+
+  delta_pct="$(awk -v b="$before_pct" -v a="$after_pct" 'BEGIN{printf "%.2f", b-a}')"
+  delta_rss="$(( before_rss - after_rss ))"
+
+  results="$(jq --arg id "$id" --arg name "$name" \
+    --argjson beforePct "$before_pct" --argjson afterPct "$after_pct" --argjson deltaPct "$delta_pct" \
+    --argjson beforeRss "$before_rss" --argjson afterRss "$after_rss" --argjson deltaRss "$delta_rss" \
+    '. + [{id:$id,name:$name,beforePct:$beforePct,afterPct:$afterPct,deltaPct:$deltaPct,
+           beforeRssKb:$beforeRss,afterRssKb:$afterRss,deltaRssKb:$deltaRss}]' \
+    <<<"$results")"
+done
+
+jq 'sort_by(-.deltaPct)' <<<"$results"

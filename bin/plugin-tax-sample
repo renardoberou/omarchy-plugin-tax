@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Reports current CPU% and RSS for the Omarchy shell process, using the same
+# two-snapshot method as `top -bn2`: read /proc/[pid]/stat, sleep, read again,
+# diff the tick counts. Invoked as a direct child of quickshell via
+# Quickshell.Io.Process (array-form command, no intermediate shell), so
+# $PPID is the shell's own PID — no PID discovery needed.
+#
+# Usage: plugin-tax-sample [interval_seconds]
+#   Prints one JSON line:
+#     {"pid":N,"comm":"quickshell","cpuPct":F,"rssKb":N}
+#   or {"error":"pid-gone"} if the process disappeared mid-sample.
+set -uo pipefail
+
+interval="${1:-1.2}"
+pid="$PPID"
+clk_tck="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+
+read_ticks() {
+  local stat rest
+  stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+  # comm (field 2) is the only field that can contain spaces/parens, and it's
+  # always wrapped in the LAST matching "(...)" — split there, then the
+  # remaining fields are space-separated and fixed-width from field 3 on.
+  rest="${stat##*) }"
+  # fields after comm, 1-indexed from field 3: state pid... utime(14) stime(15)
+  # cutime(16) cstime(17) relative to the ORIGINAL line, i.e. index 12/13/14/15
+  # (1-indexed) of $rest.
+  read -r _state _ppid _pgrp _session _tty _tpgid _flags _minflt _cminflt _majflt _cmajflt \
+    utime stime cutime cstime _rest <<<"$rest"
+  [[ -n "${utime:-}" && -n "${stime:-}" ]] || return 1
+  echo "$(( utime + stime + ${cutime:-0} + ${cstime:-0} ))"
+}
+
+if [[ ! -d "/proc/$pid" ]]; then
+  echo '{"error":"pid-gone"}'
+  exit 0
+fi
+
+comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo "")"
+
+t0="$(read_ticks)" || { echo '{"error":"pid-gone"}'; exit 0; }
+sleep "$interval"
+t1="$(read_ticks)" || { echo '{"error":"pid-gone"}'; exit 0; }
+
+rss_kb="$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)"
+[[ -n "$rss_kb" ]] || rss_kb=0
+
+delta=$(( t1 - t0 ))
+cpu_pct="$(awk -v d="$delta" -v tck="$clk_tck" -v iv="$interval" \
+  'BEGIN{ if (iv <= 0) iv = 1; printf "%.2f", (d/tck)/iv*100 }')"
+
+printf '{"pid":%d,"comm":"%s","cpuPct":%s,"rssKb":%s}\n' \
+  "$pid" "${comm//\"/}" "$cpu_pct" "$rss_kb"
