@@ -27,6 +27,11 @@ settle="1.5"
 command -v jq >/dev/null 2>&1 || { echo '[]'; exit 0; }
 command -v omarchy >/dev/null 2>&1 || { echo '[]'; exit 0; }
 
+# Our own plugin id — never audit ourselves. Disabling this plugin unloads
+# the QML Process running this very script, killing it before it can
+# re-enable what it disabled, so it would vanish from the bar for good.
+own_id="$(jq -r '.id // empty' "$here/../manifest.json" 2>/dev/null)"
+
 declare -a disabled_by_us=()
 
 cleanup() {
@@ -40,8 +45,9 @@ trap cleanup EXIT INT TERM
 plugins_json="$(omarchy plugin list --json 2>/dev/null)"
 [[ -n "$plugins_json" ]] || plugins_json="[]"
 
-mapfile -t ids < <(jq -r '
+mapfile -t ids < <(jq -r --arg ownId "$own_id" '
   .[] | select(.firstParty == false and .enabled == true)
+      | select(.id != $ownId)
       | select((.kinds // []) | index("bar") | not)
       | .id
 ' <<<"$plugins_json" 2>/dev/null)

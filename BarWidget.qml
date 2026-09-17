@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import qs.Ui
 import qs.Commons
@@ -121,68 +122,76 @@ BarWidget {
         font.pixelSize: Style.font.caption
       }
 
-      Column {
+      // ListView, not a Column+Repeater: an audit can turn up more plugins
+      // than fit in the popup's height cap, and a plain Column has no way to
+      // scroll the overflow into view — it just renders off-card.
+      ListView {
+        id: resultsList
         width: parent.width
+        height: Math.min(contentHeight, Style.space(240))
         spacing: Style.space(8)
         visible: root.auditResults.length > 0
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        interactive: contentHeight > height
 
-        Repeater {
-          model: root.auditResults
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-          Row {
-            id: rowItem
-            required property var modelData
-            width: parent.width
-            spacing: Style.space(8)
+        model: root.auditResults
 
-            readonly property bool isOff: root.disabledIds.indexOf(modelData.id) >= 0
+        delegate: Row {
+          id: rowItem
+          required property var modelData
+          width: ListView.view.width
+          spacing: Style.space(8)
 
-            Rectangle {
-              width: Style.space(8)
-              height: Style.space(8)
-              radius: width / 2
-              anchors.verticalCenter: parent.verticalCenter
-              color: modelData.flagged ? (root.bar ? root.bar.urgent : Color.urgent) : "#5fd68a"
-              opacity: rowItem.isOff ? 0.35 : 1.0
+          readonly property bool isOff: root.disabledIds.indexOf(modelData.id) >= 0
+
+          Rectangle {
+            width: Style.space(8)
+            height: Style.space(8)
+            radius: width / 2
+            anchors.verticalCenter: parent.verticalCenter
+            color: modelData.flagged ? (root.bar ? root.bar.urgent : Color.urgent) : "#5fd68a"
+            opacity: rowItem.isOff ? 0.35 : 1.0
+          }
+
+          Column {
+            width: parent.width - Style.space(120)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(1)
+
+            Text {
+              textFormat: Text.PlainText
+              text: modelData.name || modelData.id
+              elide: Text.ElideRight
+              width: parent.width
+              color: root.bar ? root.bar.foreground : Color.foreground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              opacity: rowItem.isOff ? 0.5 : 1.0
             }
 
-            Column {
-              width: parent.width - Style.space(120)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(1)
-
-              Text {
-                textFormat: Text.PlainText
-                text: modelData.name || modelData.id
-                elide: Text.ElideRight
-                width: parent.width
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.bodySmall
-                opacity: rowItem.isOff ? 0.5 : 1.0
-              }
-
-              Text {
-                textFormat: Text.PlainText
-                text: (modelData.deltaPct >= 0 ? "+" : "") + Number(modelData.deltaPct).toFixed(1) +
-                  "% cpu idle" + (rowItem.isOff ? " · disabled" : "")
-                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.caption
-              }
+            Text {
+              textFormat: Text.PlainText
+              text: (modelData.deltaPct >= 0 ? "+" : "") + Number(modelData.deltaPct).toFixed(1) +
+                "% cpu idle" + (rowItem.isOff ? " · disabled" : "")
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
             }
+          }
 
-            Button {
-              anchors.verticalCenter: parent.verticalCenter
-              text: rowItem.isOff ? "Off" : "Disable"
-              enabled: !rowItem.isOff
-              bordered: true
-              foreground: root.bar ? root.bar.foreground : Color.foreground
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY
-              fontSize: Style.font.caption
-              onClicked: if (svc) svc.disablePlugin(modelData.id)
-            }
+          Button {
+            anchors.verticalCenter: parent.verticalCenter
+            text: rowItem.isOff ? "Off" : "Disable"
+            enabled: !rowItem.isOff
+            bordered: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            horizontalPadding: Style.spacing.controlPaddingX
+            verticalPadding: Style.spacing.controlPaddingY
+            fontSize: Style.font.caption
+            onClicked: if (svc) svc.disablePlugin(modelData.id)
           }
         }
       }

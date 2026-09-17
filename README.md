@@ -45,6 +45,13 @@ bin/plugin-tax-sample   one CPU/RSS sample of the shell process (own $PPID)
 bin/plugin-tax-audit    the disable → sample → re-enable loop, emits ranked JSON
 ```
 
+## Install / remove
+
+```
+omarchy plugin add https://github.com/renardoberou/omarchy-plugin-tax --enable
+omarchy plugin remove renardoberou.plugin-tax
+```
+
 ## Local dev
 
 ```
