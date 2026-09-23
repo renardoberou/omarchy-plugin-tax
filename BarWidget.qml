@@ -71,7 +71,7 @@ BarWidget {
     bar: root.bar
     owner: root
     open: root.popupOpen
-    contentWidth: popup.fittedContentWidth(Style.space(340))
+    contentWidth: popup.fittedContentWidth(Style.space(400))
     contentHeight: popup.fittedContentHeight(column.implicitHeight, Style.space(420))
 
     Column {
@@ -195,7 +195,7 @@ BarWidget {
           }
 
           Column {
-            width: parent.width - Style.space(120)
+            width: parent.width - Style.space(8) - rowButtons.width - 2 * rowItem.spacing
             anchors.verticalCenter: parent.verticalCenter
             spacing: Style.space(1)
 
@@ -221,18 +221,37 @@ BarWidget {
             }
           }
 
-          Button {
+          Row {
+            id: rowButtons
             anchors.verticalCenter: parent.verticalCenter
-            text: rowItem.isPending ? "…" : (rowItem.isOff ? "Re-enable" : "Disable")
-            enabled: !rowItem.isPending && !root.auditing
-            bordered: true
-            foreground: root.fg
-            horizontalPadding: Style.spacing.controlPaddingX
-            verticalPadding: Style.spacing.controlPaddingY
-            fontSize: Style.font.caption
-            onClicked: if (svc) {
-              if (rowItem.isOff) svc.reenablePlugin(modelData.id)
-              else svc.disablePlugin(modelData.id)
+            spacing: Style.space(4)
+
+            // Re-measure just this plugin (~20s) -- e.g. after updating it,
+            // or when a result is marked "within noise".
+            Button {
+              visible: !rowItem.isOff
+              text: "Re-test"
+              enabled: !rowItem.isPending && !root.auditing
+              bordered: true
+              foreground: root.fg
+              horizontalPadding: Style.spacing.controlPaddingX
+              verticalPadding: Style.spacing.controlPaddingY
+              fontSize: Style.font.caption
+              onClicked: if (svc) svc.runAudit(modelData.id)
+            }
+
+            Button {
+              text: rowItem.isPending ? "…" : (rowItem.isOff ? "Re-enable" : "Disable")
+              enabled: !rowItem.isPending && !root.auditing
+              bordered: true
+              foreground: root.fg
+              horizontalPadding: Style.spacing.controlPaddingX
+              verticalPadding: Style.spacing.controlPaddingY
+              fontSize: Style.font.caption
+              onClicked: if (svc) {
+                if (rowItem.isOff) svc.reenablePlugin(modelData.id)
+                else svc.disablePlugin(modelData.id)
+              }
             }
           }
         }

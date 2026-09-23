@@ -1,5 +1,7 @@
 # Plugin Tax
 
+![Plugin Tax panel: shell CPU, Run audit, per-plugin results](preview.png)
+
 An Omarchy shell plugin that watches the shell's own idle CPU headroom and,
 on demand, finds out which enabled third-party plugin is spending it.
 
@@ -9,7 +11,7 @@ Omarchy plugins are QML loaded into one long-lived, unsandboxed `quickshell`
 process — there's no per-plugin PID, so the OS scheduler can't hand you a
 "this plugin costs X% CPU" number the way `top` can for a normal process.
 The only reliable way to attribute cost is the manual test that already
-caught a real CPU leak on this machine once (a wallpaper shader plugin
+caught a real CPU leak on the author's machine (a wallpaper shader plugin
 quietly burning ~16% CPU at idle): disable the plugin, compare whole-shell
 CPU before and after, re-enable it. This plugin automates that test and
 runs it across every enabled third-party plugin instead of one at a time
@@ -31,6 +33,8 @@ by hand.
   folder). Verdicts: **flagged** (≥3% and every round agrees, or helpers
   ≥3%), **minor**, **within noise**. Progress and time left are shown on
   the button. About 20s per plugin.
+- **Re-test** per row: re-measures just that plugin (~25s) and updates its
+  row — useful after updating a plugin or when a result is "within noise".
 - **Disable / Re-enable** per row. Re-enable puts the widget back in its
   original bar slot with its settings.
 
@@ -43,7 +47,7 @@ to that far more loudly than most plugins cost:
 
 - **Omarchy's own tooling.** A config write makes first-party plugins
   refresh — `omarchy-agent-usage` (which launches `codex`), `omarchy-network`,
-  `omarchy-monitor`, a `pacman -Qi` package check. Measured on this machine:
+  `omarchy-monitor`, a package-status check. Measured on this machine:
   bursts of 100–500% for about a second, repeating for ~10s. Processes whose
   command line runs an `omarchy-*` tool or lives under `/usr/share/omarchy/`
   are pruned from the audit's tree (never anything under
@@ -57,7 +61,9 @@ the level before the plugin was touched (up to 10s) before sampling.
 With those in place the e2e fixtures read 17.1% ±0 and 12.2% ±0; before,
 the same run gave spreads of ±22–55% on ordinary plugins.
 
-The pill does none of this filtering — it's the honest total.
+The bar pill uses the same metric, so its number and the audit's agree,
+and it skips the first sample after startup or an audit (the shell is busy
+reloading then).
 
 ### Why the audit measures a process tree, not a PID
 
@@ -86,6 +92,23 @@ only the audited plugin back in its slot, and says so in the panel.
 
 First-party plugins and full-bar replacements (`kind: "bar"`) are still
 excluded: toggling core Omarchy UI is a worse kind of disruptive.
+
+## Requirements
+
+Nothing to install on a standard Omarchy system. It uses `bash`, `gawk`,
+`jq`, `flock` (util-linux) and the `omarchy` CLI, all present by default.
+No network access, no root, no background daemon: the only process it
+runs continuously is a 1.2s sample every 20s.
+
+## What it changes on your system
+
+- **Run audit** switches plugins off and on through `omarchy plugin
+  disable`, and restores `~/.config/omarchy/shell.json` from the copy it
+  took before starting. It only does this when you press the button.
+- **Disable / Re-enable** on a result row does the same for one plugin.
+- State lives in `~/.local/state/plugin-tax/` (last audit, crash journal,
+  saved placements). Removing the plugin leaves that folder behind; delete
+  it if you like.
 
 ## Structure
 
@@ -143,9 +166,10 @@ inside a symlinked dev checkout need `omarchy restart shell` to load.
   the Disabled list do persist).
 - The toggle delta is still a statistical measurement: costs under ~1%
   are reported as "within noise" rather than guessed at.
-- Short-lived processes a plugin spawns from QML (e.g. `hyprctl` every few
-  seconds) are not in the audit's number — they are dead before they can be
-  attributed. They do show in the pill's "helpers" figure.
+- Short-lived processes a plugin spawns (e.g. a `hyprctl` call every few
+  seconds) are **not measured** by the pill or the audit — they exit before
+  they can be attributed. Only the QML work of starting them and reading
+  their output is counted (it runs in the shell's own process).
 - A third-party plugin that does its work through `omarchy-*` CLI tools is
   under-counted for the same reason Omarchy's own refreshes are excluded.
 - Helper attribution is by command line. A helper started through a

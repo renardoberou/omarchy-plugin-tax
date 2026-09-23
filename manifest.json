@@ -5,7 +5,7 @@
   "version": "0.2.0",
   "author": "Bernardo Roustand",
   "license": "MIT",
-  "description": "Tracks the Omarchy shell's own CPU headroom and, on demand, audits every enabled third-party plugin by disabling each one in turn and measuring the CPU/RSS it was costing at idle.",
+  "description": "Shows the Omarchy shell's CPU use (helper processes included) and, on demand, audits each enabled third-party plugin by switching it off and on in measured rounds -- restoring your bar layout exactly afterwards.",
   "kinds": [
     "service",
     "bar-widget"
@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Plugin Tax",
-    "description": "Idle CPU headroom for the shell, with a one-click audit that finds which plugin is costing it.",
+    "description": "Shell CPU at a glance, and a one-click audit that finds which plugin is costing it.",
     "category": "System",
     "allowMultiple": false
   }

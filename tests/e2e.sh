@@ -37,8 +37,15 @@ teardown() {
 }
 trap teardown EXIT
 
-ln -sfn "$here/fixtures/burn-child" "$plugins/plugintax-test.burn-child"
-ln -sfn "$here/fixtures/burn-qml" "$plugins/plugintax-test.burn-qml"
+# Fixture manifests are stored as fixture-manifest.json so the marketplace
+# validator never mistakes them for extra plugins in this repository; build
+# real plugin folders from them in a temp dir.
+for name in burn-child burn-qml; do
+  mkdir -p "$work/$name"
+  cp -r "$here/fixtures/$name/." "$work/$name/"
+  mv "$work/$name/fixture-manifest.json" "$work/$name/manifest.json"
+  ln -sfn "$work/$name" "$plugins/plugintax-test.$name"
+done
 omarchy-shell -q shell rescanPlugins >/dev/null 2>&1
 # The rescan is asynchronous; wait until the shell knows both fixtures.
 for (( i = 0; i < 40; i++ )); do

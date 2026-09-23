@@ -28,6 +28,9 @@
 #               first-party plugins refresh (omarchy-agent-usage -> codex,
 #               omarchy-network, ...) -- seconds of CPU that belong to the
 #               reload, not to the plugin being toggled.
+#   --ignore-first-party  shorthand for --ignore-cmd with the built-in
+#               pattern for Omarchy's own tooling (below), plus --ignore-reaped.
+#               Used by both the bar pill and the audit so they agree.
 #   --ignore-reaped  don't count children that were born and reaped inside
 #               the window (their origin can't be attributed once dead).
 #   --any-comm  skip the "is this really quickshell?" check (tests only)
@@ -50,6 +53,13 @@ interval="1.2"
 slices=1
 ignore_re=""
 ignore_reaped=0
+# Omarchy's own tooling, spawned by first-party plugins: an omarchy-* command
+# anywhere in the command line (they often launch via `bash -c '...'`), the
+# package check's `__omarchy_pkgs` snippet, or any path under
+# /usr/share/omarchy/. Every shell.json write makes these refresh -- bursts
+# of 100-500% measured -- which is Omarchy's cost, not a plugin's. Anything
+# under ~/.config/omarchy/plugins/ is never pruned (see ignored_top).
+first_party_re="${PLUGIN_TAX_IGNORE_RE:-(^|[ /;&|(\'\"])(__)?omarchy[-_][a-z]|/usr/share/omarchy/}"
 any_comm=0
 excludes=("$$")
 
@@ -61,6 +71,7 @@ while (( $# > 0 )); do
     --slices) need "$1" $#; slices="$2"; shift 2 ;;
     --ignore-cmd) need "$1" $#; ignore_re="$2"; shift 2 ;;
     --ignore-reaped) ignore_reaped=1; shift ;;
+    --ignore-first-party) ignore_re="$first_party_re"; ignore_reaped=1; shift ;;
     --exclude) need "$1" $#; [[ -n "$2" ]] && excludes+=("$2"); shift 2 ;;
     --any-comm) any_comm=1; shift ;;
     # Back-compat with v0.1's positional form: plugin-tax-sample 1.2

@@ -267,19 +267,13 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-# Omarchy's own tooling, spawned by first-party plugins. Their bursts are a
-# reaction to the audit's config writes, not a cost of the plugin under
-# test, so the audit's metric leaves them out (the pill still counts them).
-# Matches an omarchy-* command anywhere in the command line (first-party
-# plugins often launch through `bash -c '...omarchy-agent-usage...'`), the
-# package check's `__omarchy_pkgs` shell snippet, or any path under
-# /usr/share/omarchy/. The sampler never prunes anything
-# under ~/.config/omarchy/plugins/ regardless.
-ignore_re="${PLUGIN_TAX_IGNORE_RE:-(^|[ /;&|(\'\"])(__)?omarchy[-_][a-z]|/usr/share/omarchy/}"
-
+# The audit leaves Omarchy's own tooling and short-lived children out of
+# its metric (see --ignore-first-party in plugin-tax-sample): every toggle
+# rewrites shell.json, and first-party plugins react to that far more loudly
+# than most plugins cost.
 take() {
   "$sampler" --pid "$shell_pid" --interval "$sample" --slices 5 --exclude "$$" \
-    --ignore-cmd "$ignore_re" --ignore-reaped "${any_comm[@]}"
+    --ignore-first-party "${any_comm[@]}"
 }
 
 # Toggling a plugin that owns windows (overlays, panels) costs a burst of
@@ -295,7 +289,7 @@ quiet() {  # $1 = reference cpuPct
   t0="${EPOCHREALTIME%.*}"
   while (( ${EPOCHREALTIME%.*} - t0 < settle_max )); do
     q="$("$sampler" --pid "$shell_pid" --interval 0.5 --exclude "$$" \
-      --ignore-cmd "$ignore_re" --ignore-reaped "${any_comm[@]}")"
+      --ignore-first-party "${any_comm[@]}")"
     p="$(jq -r '.cpuPct // 999' <<<"$q" 2>/dev/null)"
     if awk -v p="$p" -v r="$ref" 'BEGIN{exit !(p <= r + 2)}'; then
       ok=$(( ok + 1 )); (( ok >= 2 )) && return 0

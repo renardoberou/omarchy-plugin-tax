@@ -8,7 +8,7 @@ import "Model.js" as Model
 // via bar.shell.serviceFor(pluginId) and never talks to /proc or the
 // omarchy CLI directly itself.
 //
-// IPC (also what .dev/e2e.sh drives):
+// IPC (also what tests/e2e.sh drives):
 //   omarchy-shell renardoberou.plugin-tax runAudit
 //   omarchy-shell renardoberou.plugin-tax status | jq
 Item {
@@ -34,6 +34,7 @@ Item {
   readonly property real auditFlagThresholdPct: 3
 
   property var history: []
+  property double quietUntil: 0
   property string sampleError: ""
   readonly property bool alerting: Model.isAlerting(history, alertThresholdPct, sustainSamples)
   readonly property string pillText: Model.formatPill(history, alerting)
@@ -58,7 +59,10 @@ Item {
 
   function sample() {
     if (sampleProc.running) return
-    sampleProc.command = [root.samplerPath, "--interval", String(root.sampleIntervalSec)]
+    // Same metric as the audit: Omarchy's own tooling is left out, so the
+    // pill doesn't jump to hundreds of percent every time a first-party
+    // plugin refreshes (e.g. agent usage checks launching codex).
+    sampleProc.command = [root.samplerPath, "--interval", String(root.sampleIntervalSec), "--ignore-first-party"]
     sampleProc.running = true
   }
 
@@ -174,6 +178,9 @@ Item {
   // Put back anything a crashed audit left disabled, and load the last audit
   // and the Disabled list, before the first sample.
   Component.onCompleted: {
+    // The shell itself is busy for a few seconds while it starts; the first
+    // pill sample would otherwise always show a scary startup spike.
+    root.quietUntil = Date.now() + 10000
     startupProc.command = [root.auditPath, "--startup"]
     startupProc.running = true
   }
@@ -184,7 +191,7 @@ Item {
     repeat: true
     triggeredOnStart: true
     // Skip the periodic sample while an audit owns the sampler.
-    onTriggered: if (!root.auditing) root.sample()
+    onTriggered: if (!root.auditing && Date.now() >= root.quietUntil) root.sample()
   }
 
   Process {
@@ -210,6 +217,9 @@ Item {
     onExited: function(exitCode, exitStatus) {
       root.auditing = false
       root.auditProgress = null
+      // The audit's last config write still has the shell busy for a few
+      // seconds; skip the pill's next sample rather than record that.
+      root.quietUntil = Date.now() + root.pollMs
     }
   }
 
