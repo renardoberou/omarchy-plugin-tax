@@ -2,11 +2,15 @@ import QtQuick
 import Quickshell.Io
 import "Model.js" as Model
 
-// Headless. Samples the shell's own CPU on a timer, keeps a rolling
-// "lean baseline", and runs the on-demand disable/re-enable audit that
-// attributes cost to individual third-party plugins. BarWidget.qml reads
-// this service's state via bar.shell.serviceFor(pluginId) and never talks
-// to /proc or the omarchy CLI directly itself.
+// Headless. Samples the shell's own process tree on a timer, keeps a rolling
+// "usual" baseline, and runs the on-demand audit that attributes cost to
+// individual third-party plugins. BarWidget.qml reads this service's state
+// via bar.shell.serviceFor(pluginId) and never talks to /proc or the
+// omarchy CLI directly itself.
+//
+// IPC (also what .dev/e2e.sh drives):
+//   omarchy-shell renardoberou.plugin-tax runAudit
+//   omarchy-shell renardoberou.plugin-tax status | jq
 Item {
   id: root
   property var shell: null
@@ -23,45 +27,155 @@ Item {
   readonly property int historyWindowMs: 30 * 60 * 1000
   readonly property int historyMaxLen: 120
 
-  // Audit tuning.
-  readonly property real auditSampleIntervalSec: 1.5
+  // Audit tuning. One threshold, used by the verdicts AND the summary text.
+  readonly property int auditRounds: 2
+  readonly property real auditSampleSec: 2
+  readonly property real auditSettleSec: 2
   readonly property real auditFlagThresholdPct: 3
 
   property var history: []
+  property string sampleError: ""
   readonly property bool alerting: Model.isAlerting(history, alertThresholdPct, sustainSamples)
   readonly property string pillText: Model.formatPill(history, alerting)
-  readonly property string tooltip: Model.tooltipText(history, alerting)
+  readonly property string tooltip: Model.tooltipText(history, alerting, sampleError)
 
   property bool auditing: false
+  property var auditProgress: null
+  property var auditWarnings: []
   property var auditResults: []
   property double auditRanAt: 0
-  readonly property string auditSummary: Model.summarize(auditResults)
+  property string auditOnly: ""
+  readonly property string auditSummary: Model.summarize(auditResults, auditFlagThresholdPct)
+  readonly property string progressText: Model.progressText(auditProgress)
 
-  // Plugins this session has disabled via the panel's per-row button —
-  // purely for the UI to grey the row out; the omarchy CLI is the source
-  // of truth for actual enabled state.
+  // One-off message for the panel, e.g. "Re-enabled X after an interrupted audit."
+  property string notice: ""
+
+  // Plugins turned off from this panel (persisted by the audit script with
+  // their bar placement, so Re-enable puts them back exactly).
   property var disabledIds: []
+  property var pendingIds: []
 
   function sample() {
     if (sampleProc.running) return
-    sampleProc.command = [root.samplerPath, String(root.sampleIntervalSec)]
+    sampleProc.command = [root.samplerPath, "--interval", String(root.sampleIntervalSec)]
     sampleProc.running = true
   }
 
-  function runAudit() {
-    if (root.auditing || auditProc.running) return
+  function runAudit(onlyId) {
+    if (root.auditing || auditProc.running) return false
     root.auditing = true
-    auditProc.command = [root.auditPath, String(root.auditSampleIntervalSec)]
+    root.auditOnly = onlyId || ""
+    root.auditProgress = null
+    root.auditWarnings = []
+    var cmd = [root.auditPath,
+      "--rounds", String(root.auditRounds),
+      "--sample", String(root.auditSampleSec),
+      "--settle", String(root.auditSettleSec)]
+    if (root.auditOnly) cmd.push("--only", root.auditOnly)
+    auditProc.command = cmd
     auditProc.running = true
+    return true
   }
 
-  function disablePlugin(id) {
-    if (!id) return
-    disableProc.command = ["omarchy", "plugin", "disable", id]
-    disableProc.running = true
-    var next = root.disabledIds.slice()
-    if (next.indexOf(id) < 0) next.push(id)
-    root.disabledIds = next
+  // ---- panel Disable / Re-enable, strictly one CLI call at a time --------
+  // v0.1 reused a single Process, so a second click replaced the first
+  // command before it ran.
+  property var ctlQueue: []
+
+  function enqueue(args, id) {
+    if (root.pendingIds.indexOf(id) >= 0) return
+    root.pendingIds = root.pendingIds.concat([id])
+    root.ctlQueue = root.ctlQueue.concat([[root.auditPath].concat(args)])
+    pumpCtl()
+  }
+
+  function pumpCtl() {
+    if (ctlProc.running || !root.ctlQueue.length) return
+    ctlProc.command = root.ctlQueue[0]
+    root.ctlQueue = root.ctlQueue.slice(1)
+    ctlProc.running = true
+  }
+
+  function disablePlugin(id) { if (id) enqueue(["--disable", id], id) }
+  function reenablePlugin(id) { if (id) enqueue(["--reenable", id], id) }
+
+  function dropPending(id) {
+    root.pendingIds = root.pendingIds.filter(function(p) { return p !== id })
+  }
+
+  function handleCtlLine(line) {
+    var d = Model.parseAuditLine(line)
+    if (!d) return
+    if (d.type === "disabled") {
+      if (root.disabledIds.indexOf(d.id) < 0) root.disabledIds = root.disabledIds.concat([d.id])
+      dropPending(d.id)
+    } else if (d.type === "reenabled") {
+      root.disabledIds = root.disabledIds.filter(function(x) { return x !== d.id })
+      dropPending(d.id)
+    } else if (d.type === "error") {
+      root.notice = d.message
+    }
+  }
+
+  function handleAuditLine(line) {
+    var d = Model.parseAuditLine(line)
+    if (!d) return
+    if (d.type === "start") {
+      root.auditProgress = { index: 0, total: d.total, name: "", etaSec: d.etaSec }
+    } else if (d.type === "progress") {
+      root.auditProgress = d
+    } else if (d.type === "warning") {
+      root.auditWarnings = root.auditWarnings.concat([d.message])
+    } else if (d.type === "recovered") {
+      root.notice = d.message
+    } else if (d.type === "error") {
+      root.notice = "Audit failed: " + d.message
+    } else if (d.type === "result") {
+      root.auditResults = root.auditOnly
+        ? Model.mergeResults(root.auditResults, d.results, root.auditFlagThresholdPct)
+        : Model.rankAudit(d.results, root.auditFlagThresholdPct)
+      root.auditRanAt = d.ranAt || Date.now()
+    }
+  }
+
+  function handleStartupLine(line) {
+    var d = Model.parseAuditLine(line)
+    if (!d) return
+    if (d.type === "recovered") root.notice = d.message
+    else if (d.type === "warning") root.notice = d.message
+    else if (d.type === "status") {
+      root.disabledIds = d.disabled || []
+      if (d.last && root.auditResults.length === 0) {
+        root.auditResults = Model.rankAudit(Model.parseAudit(JSON.stringify(d.last)), root.auditFlagThresholdPct)
+        root.auditRanAt = d.last.ranAt || 0
+      }
+    }
+  }
+
+  function statusJson() {
+    var last = root.history.length ? root.history[root.history.length - 1] : null
+    return JSON.stringify({
+      auditing: root.auditing,
+      progress: root.auditProgress,
+      warnings: root.auditWarnings,
+      notice: root.notice,
+      sample: last,
+      sampleError: root.sampleError,
+      disabled: root.disabledIds,
+      ranAt: root.auditRanAt,
+      results: root.auditResults.map(function(r) {
+        return { id: r.id, verdict: r.verdict, costPct: r.costPct, deltaPct: r.deltaPct,
+                 spreadPct: r.spreadPct, helperPct: r.helperPct, on: r.on, off: r.off }
+      })
+    })
+  }
+
+  // Put back anything a crashed audit left disabled, and load the last audit
+  // and the Disabled list, before the first sample.
+  Component.onCompleted: {
+    startupProc.command = [root.auditPath, "--startup"]
+    startupProc.running = true
   }
 
   Timer {
@@ -69,9 +183,7 @@ Item {
     running: true
     repeat: true
     triggeredOnStart: true
-    // Skip the periodic sample while an audit owns the sampler — an audit
-    // is already toggling plugins and reading CPU far more precisely than
-    // this idle poll would in the middle of it.
+    // Skip the periodic sample while an audit owns the sampler.
     onTriggered: if (!root.auditing) root.sample()
   }
 
@@ -81,36 +193,46 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         var parsed = Model.parseSample(text)
-        if (!parsed || typeof parsed.cpuPct !== "number") return
-        root.history = Model.pushSample(
-          root.history,
-          { t: Date.now(), cpuPct: parsed.cpuPct },
-          root.historyWindowMs,
-          root.historyMaxLen
-        )
+        if (!parsed) {
+          root.sampleError = Model.sampleError(text) || "no output"
+          return
+        }
+        root.sampleError = ""
+        parsed.t = Date.now()
+        root.history = Model.pushSample(root.history, parsed, root.historyWindowMs, root.historyMaxLen)
       }
     }
   }
 
   Process {
     id: auditProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.auditResults = Model.rankAudit(Model.parseAudit(text), root.auditFlagThresholdPct)
-        root.auditRanAt = Date.now()
-        root.auditing = false
-        // The audit already disabled/re-enabled everything it touched — a
-        // fresh audit run starts clean, so per-row "disabled by me" state
-        // from a previous run no longer applies.
-        root.disabledIds = []
-      }
+    stdout: SplitParser { onRead: function(line) { root.handleAuditLine(line) } }
+    onExited: function(exitCode, exitStatus) {
+      root.auditing = false
+      root.auditProgress = null
     }
-    onExited: if (root.auditing) root.auditing = false
   }
 
   Process {
-    id: disableProc
-    stdout: StdioCollector { waitForEnd: true }
+    id: startupProc
+    stdout: SplitParser { onRead: function(line) { root.handleStartupLine(line) } }
+  }
+
+  Process {
+    id: ctlProc
+    stdout: SplitParser { onRead: function(line) { root.handleCtlLine(line) } }
+    onExited: function(exitCode, exitStatus) {
+      // A crashed call must not leave its row stuck in "pending".
+      var cmd = ctlProc.command || []
+      root.dropPending(String(cmd[cmd.length - 1] || ""))
+      Qt.callLater(root.pumpCtl)
+    }
+  }
+
+  IpcHandler {
+    target: "renardoberou.plugin-tax"
+    function runAudit(): string { return root.runAudit("") ? "started" : "already running" }
+    function runAuditOnly(id: string): string { return root.runAudit(id) ? "started" : "already running" }
+    function status(): string { return root.statusJson() }
   }
 }

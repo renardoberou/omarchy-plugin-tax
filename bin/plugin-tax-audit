@@ -1,94 +1,394 @@
 #!/usr/bin/env bash
-# Automates the manual "unload it and compare top -bn2 before/after" test
-# that originally caught the omalava CPU leak — run once across every
-# enabled third-party plugin instead of one at a time by hand.
+# Plugin Tax audit: attributes the Omarchy shell's idle CPU to individual
+# third-party plugins by switching each one off and on again and measuring
+# the shell AND its whole process tree (plugin helper daemons included) in
+# interleaved ON/OFF rounds.
 #
-# For each enabled, third-party, non-"bar"-kind plugin: sample shell
-# CPU/RSS, disable the plugin, let the shell settle, sample again, then
-# re-enable it. First-party plugins and full-bar replacements are left
-# alone in this v1 — toggling the active bar or a core Omarchy feature is a
-# different, worse kind of disruptive than blinking a third-party widget.
+# Safety model (v0.1 got all of these wrong):
+#   * The measured PID is the shell that launched us ($PPID, or --shell-pid),
+#     checked to be quickshell -- never this script's own process.
+#   * Re-enabling is NOT `omarchy plugin enable`: that re-inserts a bar widget
+#     at its default slot with no settings. Instead the exact shell.json from
+#     before the audit is written back (the shell watches the file and
+#     reloads it), so position and per-widget settings survive.
+#   * A journal records the plugin that is currently off. If this process is
+#     killed hard, `--recover` (run by Service.qml at startup) puts that one
+#     plugin back without clobbering anything else changed since.
+#   * One audit/recovery at a time, via flock.
 #
-# Disruptive by design (each plugin blinks off for a few seconds) — meant
-# to be run on demand from the Plugin Tax panel, not on a timer. Always
-# re-enables anything it disabled, even on failure or interrupt.
+# Usage:
+#   plugin-tax-audit [--rounds N] [--sample S] [--settle S] [--only ID]
+#                    [--shell-pid PID] [--any-comm]
+#   plugin-tax-audit --startup          recover if needed, then print status
+#   plugin-tax-audit --recover
+#   plugin-tax-audit --disable ID       panel "Disable", remembers placement
+#   plugin-tax-audit --reenable ID      undo the above, placement intact
 #
-# Usage: plugin-tax-audit [sample_interval_seconds]
-#   Prints one JSON array to stdout, sorted by deltaPct descending:
-#     [{"id":..,"name":..,"beforePct":F,"afterPct":F,"deltaPct":F,
-#       "beforeRssKb":N,"afterRssKb":N,"deltaRssKb":N}, ...]
+# Audit output is JSON lines on stdout:
+#   {"type":"start","total":N,"etaSec":S}
+#   {"type":"progress","index":I,"total":N,"id":..,"name":..,"etaSec":S}
+#   {"type":"warning","message":..}
+#   {"type":"result","ranAt":MS,"rounds":R,"sampleSec":S,"results":[
+#      {"id","name","on":[..],"off":[..],"onChild":[..],"offChild":[..],
+#       "onRssKb":N,"offRssKb":N,"restored":bool}]}
+#   {"type":"error","message":..}
+# Statistics (deltas, medians, verdicts) are computed in Model.js.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 sampler="$here/plugin-tax-sample"
-interval="${1:-1.5}"
-settle="1.5"
+config="${PLUGIN_TAX_CONFIG:-$HOME/.config/omarchy/shell.json}"
+state="${PLUGIN_TAX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/plugin-tax}"
+journal="$state/journal.json"
+snapshot="$state/snapshot.json"
+lockfile="$state/lock"
+last="$state/last-audit.json"
+mkdir -p "$state/disabled"
 
-command -v jq >/dev/null 2>&1 || { echo '[]'; exit 0; }
-command -v omarchy >/dev/null 2>&1 || { echo '[]'; exit 0; }
+rounds=2
+sample=2
+settle=2
+only=""
+shell_pid="$PPID"
+any_comm=()
+mode="audit"
+target=""
 
-# Our own plugin id — never audit ourselves. Disabling this plugin unloads
-# the QML Process running this very script, killing it before it can
-# re-enable what it disabled, so it would vanish from the bar for good.
-own_id="$(jq -r '.id // empty' "$here/../manifest.json" 2>/dev/null)"
+emit() { jq -nc "$@"; }
+say() { emit --arg t "$1" --arg m "$2" '{type:$t, message:$m}'; }
+die() { say error "$1"; exit 1; }
+need() { (( $2 >= 2 )) || die "$1 needs a value"; }
 
-declare -a disabled_by_us=()
-
-cleanup() {
-  local id
-  for id in "${disabled_by_us[@]:-}"; do
-    [[ -n "$id" ]] && omarchy plugin enable "$id" >/dev/null 2>&1
-  done
-}
-trap cleanup EXIT INT TERM
-
-plugins_json="$(omarchy plugin list --json 2>/dev/null)"
-[[ -n "$plugins_json" ]] || plugins_json="[]"
-
-mapfile -t ids < <(jq -r --arg ownId "$own_id" '
-  .[] | select(.firstParty == false and .enabled == true)
-      | select(.id != $ownId)
-      | select((.kinds // []) | index("bar") | not)
-      | .id
-' <<<"$plugins_json" 2>/dev/null)
-
-results="[]"
-
-for id in "${ids[@]:-}"; do
-  [[ -n "$id" ]] || continue
-  name="$(jq -r --arg id "$id" '.[] | select(.id == $id) | (.name // $id)' <<<"$plugins_json" 2>/dev/null)"
-  [[ -n "$name" ]] || name="$id"
-
-  before="$("$sampler" "$interval")"
-  before_pct="$(jq -r '.cpuPct // empty' <<<"$before" 2>/dev/null)"
-  before_rss="$(jq -r '.rssKb // empty' <<<"$before" 2>/dev/null)"
-  [[ -n "$before_pct" ]] || continue
-
-  omarchy plugin disable "$id" >/dev/null 2>&1 || continue
-  disabled_by_us+=("$id")
-  sleep "$settle"
-
-  after="$("$sampler" "$interval")"
-  after_pct="$(jq -r '.cpuPct // empty' <<<"$after" 2>/dev/null)"
-  after_rss="$(jq -r '.rssKb // empty' <<<"$after" 2>/dev/null)"
-
-  omarchy plugin enable "$id" >/dev/null 2>&1
-  for i in "${!disabled_by_us[@]}"; do
-    [[ "${disabled_by_us[$i]}" == "$id" ]] && unset 'disabled_by_us[i]'
-  done
-  sleep 1
-
-  [[ -n "$after_pct" && -n "$before_rss" && -n "$after_rss" ]] || continue
-
-  delta_pct="$(awk -v b="$before_pct" -v a="$after_pct" 'BEGIN{printf "%.2f", b-a}')"
-  delta_rss="$(( before_rss - after_rss ))"
-
-  results="$(jq --arg id "$id" --arg name "$name" \
-    --argjson beforePct "$before_pct" --argjson afterPct "$after_pct" --argjson deltaPct "$delta_pct" \
-    --argjson beforeRss "$before_rss" --argjson afterRss "$after_rss" --argjson deltaRss "$delta_rss" \
-    '. + [{id:$id,name:$name,beforePct:$beforePct,afterPct:$afterPct,deltaPct:$deltaPct,
-           beforeRssKb:$beforeRss,afterRssKb:$afterRss,deltaRssKb:$deltaRss}]' \
-    <<<"$results")"
+while (( $# > 0 )); do
+  case "$1" in
+    --rounds) need "$1" $#; rounds="$2"; shift 2 ;;
+    --sample) need "$1" $#; sample="$2"; shift 2 ;;
+    --settle) need "$1" $#; settle="$2"; shift 2 ;;
+    --only) need "$1" $#; only="$2"; shift 2 ;;
+    --shell-pid) need "$1" $#; shell_pid="$2"; shift 2 ;;
+    --any-comm) any_comm=(--any-comm); shift ;;
+    --startup|--recover) mode="${1#--}"; shift ;;
+    --disable|--reenable) need "$1" $#; mode="${1#--}"; target="$2"; shift 2 ;;
+    # v0.1 positional form: plugin-tax-audit 1.5
+    [0-9]*) sample="$1"; shift ;;
+    *) die "unknown option: $1" ;;
+  esac
 done
 
-jq 'sort_by(-.deltaPct)' <<<"$results"
+command -v jq >/dev/null 2>&1 || { echo '{"type":"error","message":"jq not found"}'; exit 1; }
+command -v omarchy >/dev/null 2>&1 || die "omarchy CLI not found"
+[[ "$rounds" =~ ^[1-9][0-9]*$ ]] || die "--rounds must be a positive integer"
+
+own_id="$(jq -r '.id // empty' "$here/../manifest.json" 2>/dev/null)"
+
+# ---- config helpers -------------------------------------------------------
+
+# Atomic replace in the same directory, so the shell's file watcher only ever
+# sees a complete file.
+write_config() {
+  local src="$1" tmp="$config.plugin-tax.$$"
+  jq -e . "$src" >/dev/null 2>&1 || return 1
+  cp "$src" "$tmp" && mv -f "$tmp" "$config"
+}
+
+same_config() { [[ "$(jq -S . "$1" 2>/dev/null)" == "$(jq -S . "$2" 2>/dev/null)" ]]; }
+
+plugin_enabled() {
+  omarchy plugin list --json 2>/dev/null |
+    jq -r --arg id "$1" '.[] | select(.id == $id) | .enabled' 2>/dev/null
+}
+
+# Wait until the running shell reports the plugin in the wanted state. This
+# matters beyond politeness: until the shell has reloaded shell.json, its
+# in-memory config is stale, and the next `plugin disable` would write that
+# stale copy back over our restore.
+wait_enabled() {
+  local id="$1" want="$2" i
+  for (( i = 0; i < 40; i++ )); do
+    [[ "$(plugin_enabled "$id")" == "$want" ]] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+# Put ONE plugin back as it was in $2 (a saved config), leaving every other
+# change in the live config alone. Used where time may have passed since the
+# snapshot (crash recovery, panel undo, an edit made mid-audit); otherwise the
+# audit writes the whole snapshot back, which is exact.
+targeted_restore() {
+  local id="$1" saved="$2" out="$state/restore.$$.json"
+  jq --slurpfile snap "$saved" --arg id "$id" '
+    def ids: map(if type == "object" then (.id // "") else . end);
+    $snap[0] as $s
+    | ([($s.bar.layout // {}) | to_entries[] | .key as $sec | .value | to_entries[]
+        | select((.value.id? // "") == $id) | {sec: $sec, i: .key, e: .value}] | first) as $loc
+    | ([(.bar.layout // {}) | to_entries[] | .value[] | select((.id? // "") == $id)] | length) as $present
+    | if $loc != null and $present == 0
+        then .bar.layout[$loc.sec] = ((.bar.layout[$loc.sec] // []) as $a | $a[:$loc.i] + [$loc.e] + $a[$loc.i:])
+        else . end
+    | if ((($s.plugins // []) | ids | index($id)) != null) and ((((.plugins // []) | ids | index($id))) == null)
+        then .plugins = ((.plugins // []) + [$s.plugins[] | select((if type == "object" then .id else . end) == $id)])
+        else . end
+    | if has("disabledPlugins") and ((($s.disabledPlugins // []) | index($id)) == null)
+        then .disabledPlugins -= [$id]
+        else . end
+  ' "$config" > "$out" 2>/dev/null || { rm -f "$out"; return 1; }
+  write_config "$out"; local rc=$?
+  rm -f "$out"
+  return $rc
+}
+
+write_journal() {  # $1 = id currently disabled, or "" between plugins
+  jq -nc --arg cur "$1" --argjson pid "$$" --argjson started "${started_ms:-0}" \
+    '{pid: $pid, startedAt: $started, current: (if $cur == "" then null else $cur end)}' \
+    > "$journal.tmp" && mv -f "$journal.tmp" "$journal"
+}
+
+# ---- modes that are not an audit -----------------------------------------
+
+recover() {
+  [[ -f "$journal" ]] || return 0
+  local cur
+  cur="$(jq -r '.current // empty' "$journal" 2>/dev/null)"
+  if [[ -n "$cur" && -f "$snapshot" ]]; then
+    if targeted_restore "$cur" "$snapshot"; then
+      wait_enabled "$cur" true || true
+      emit --arg id "$cur" '{type:"recovered", id:$id,
+        message:("Re-enabled " + $id + " after an interrupted audit.")}'
+    else
+      say warning "Could not restore $cur after an interrupted audit; snapshot kept at $snapshot"
+      return 1
+    fi
+  fi
+  rm -f "$journal" "$snapshot"
+}
+
+status() {
+  local disabled f id listed
+  # Drop placement records for plugins that were turned back on some other
+  # way (Settings, CLI) -- they are no longer "disabled by Plugin Tax".
+  listed="$(omarchy plugin list --json 2>/dev/null || echo '[]')"
+  for f in "$state"/disabled/*.json; do
+    [[ -e "$f" ]] || continue
+    id="$(basename "$f" .json)"
+    if jq -e --arg id "$id" 'any(.[]; .id == $id and .enabled == true)' <<<"$listed" >/dev/null 2>&1; then
+      rm -f "$f"
+    fi
+  done
+  disabled="$(find "$state/disabled" -maxdepth 1 -name '*.json' -printf '%f\n' 2>/dev/null |
+    sed 's/\.json$//' | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  jq -nc --argjson disabled "${disabled:-[]}" --slurpfile last <(cat "$last" 2>/dev/null || echo null) \
+    '{type:"status", disabled:$disabled, last:($last[0] // null)}'
+}
+
+case "$mode" in
+  recover|startup)
+    exec 9>"$lockfile"
+    # An audit still running (e.g. the plugin reloaded underneath it) owns
+    # the journal; its own trap will restore. Don't race it.
+    if flock -n 9; then recover; fi
+    [[ "$mode" == startup ]] && status
+    exit 0
+    ;;
+  disable)
+    [[ "$target" != "$own_id" ]] || die "refusing to disable Plugin Tax itself"
+    cp "$config" "$state/disabled/$target.json" || die "could not save placement for $target"
+    omarchy plugin disable "$target" >/dev/null 2>&1 || { rm -f "$state/disabled/$target.json"; die "disable failed: $target"; }
+    emit --arg id "$target" '{type:"disabled", id:$id}'
+    exit 0
+    ;;
+  reenable)
+    saved="$state/disabled/$target.json"
+    if [[ -f "$saved" ]]; then
+      targeted_restore "$target" "$saved" || die "could not restore $target"
+    else
+      omarchy plugin enable "$target" >/dev/null 2>&1 || die "enable failed: $target"
+    fi
+    wait_enabled "$target" true || say warning "$target did not report enabled yet"
+    rm -f "$saved"
+    emit --arg id "$target" '{type:"reenabled", id:$id}'
+    exit 0
+    ;;
+esac
+
+# ---- the audit ------------------------------------------------------------
+
+exec 9>"$lockfile"
+flock -n 9 || die "another audit is already running"
+recover || die "a previous audit left a plugin disabled and it could not be restored"
+
+shell_comm="$(cat "/proc/$shell_pid/comm" 2>/dev/null)"
+if (( ${#any_comm[@]} == 0 )) && [[ "$shell_comm" != quickshell && "$shell_comm" != qs ]]; then
+  die "parent process is '$shell_comm', not quickshell -- pass --shell-pid"
+fi
+
+plugins_json="$(omarchy plugin list --json 2>/dev/null)"
+[[ -n "$plugins_json" ]] || die "omarchy plugin list returned nothing"
+catalog_json="$(omarchy-plugin-catalog 2>/dev/null || echo '[]')"
+
+# id \t name \t sourceDir \t realpath(sourceDir)
+mapfile -t targets < <(
+  jq -r --arg ownId "$own_id" --arg only "$only" --argjson cat "$catalog_json" '
+    ($cat | map({(.id): (.sourceDir // "")}) | add // {}) as $dirs
+    | .[] | select(.firstParty == false and .enabled == true and .id != $ownId)
+    | select((.kinds // []) | index("bar") | not)
+    | select($only == "" or .id == $only)
+    | [.id, (.name // .id), ($dirs[.id] // "")] | @tsv
+  ' <<<"$plugins_json" 2>/dev/null |
+  while IFS=$'\t' read -r id name dir; do
+    [[ -n "$dir" ]] || dir="$HOME/.config/omarchy/plugins/$id"
+    printf '%s\t%s\t%s\t%s\n' "$id" "$name" "$dir" "$(realpath -q "$dir" 2>/dev/null || echo "$dir")"
+  done
+)
+
+total=${#targets[@]}
+per_plugin="$(awk -v s="$sample" -v t="$settle" -v r="$rounds" 'BEGIN{printf "%d", s + r*(2*s + 2*(t + 1.2) + 1.5)}')"
+emit --argjson n "$total" --argjson eta "$(( total * per_plugin ))" '{type:"start", total:$n, etaSec:$eta}'
+(( total > 0 )) || { emit '{type:"result", results:[]}'; exit 0; }
+
+started_ms="$(( ${EPOCHREALTIME/./} / 1000 ))"
+cp "$config" "$snapshot" || die "could not snapshot $config"
+write_journal ""
+
+current=""
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM HUP
+  if [[ -n "$current" ]]; then
+    write_config "$snapshot" && wait_enabled "$current" true
+  fi
+  if [[ -z "$current" ]] || [[ "$(plugin_enabled "$current")" == true ]]; then
+    rm -f "$journal" "$snapshot" "$state/expected-off.json"
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# Omarchy's own tooling, spawned by first-party plugins. Their bursts are a
+# reaction to the audit's config writes, not a cost of the plugin under
+# test, so the audit's metric leaves them out (the pill still counts them).
+# Matches an omarchy-* command anywhere in the command line (first-party
+# plugins often launch through `bash -c '...omarchy-agent-usage...'`), the
+# package check's `__omarchy_pkgs` shell snippet, or any path under
+# /usr/share/omarchy/. The sampler never prunes anything
+# under ~/.config/omarchy/plugins/ regardless.
+ignore_re="${PLUGIN_TAX_IGNORE_RE:-(^|[ /;&|(\'\"])(__)?omarchy[-_][a-z]|/usr/share/omarchy/}"
+
+take() {
+  "$sampler" --pid "$shell_pid" --interval "$sample" --slices 5 --exclude "$$" \
+    --ignore-cmd "$ignore_re" --ignore-reaped "${any_comm[@]}"
+}
+
+# Toggling a plugin that owns windows (overlays, panels) costs a burst of
+# CPU for a few seconds -- the fixed 2s settle of the first v0.2 draft let
+# that land in samples and gave spreads of +-20% on the e2e run. So: wait
+# at least --settle, then keep taking short samples until two in a row are
+# back within 2% of the level before this plugin was touched (or give up
+# after settle_max and sample anyway).
+settle_max=10
+quiet() {  # $1 = reference cpuPct
+  local ref="$1" ok=0 t0 q p
+  sleep "$settle"
+  t0="${EPOCHREALTIME%.*}"
+  while (( ${EPOCHREALTIME%.*} - t0 < settle_max )); do
+    q="$("$sampler" --pid "$shell_pid" --interval 0.5 --exclude "$$" \
+      --ignore-cmd "$ignore_re" --ignore-reaped "${any_comm[@]}")"
+    p="$(jq -r '.cpuPct // 999' <<<"$q" 2>/dev/null)"
+    if awk -v p="$p" -v r="$ref" 'BEGIN{exit !(p <= r + 2)}'; then
+      ok=$(( ok + 1 )); (( ok >= 2 )) && return 0
+    else
+      ok=0
+    fi
+  done
+  return 1
+}
+
+# CPU of the plugin's own helper processes in one sample: children whose
+# command line, or whose top-level ancestor's, lives in the plugin's dir.
+child_pct() {  # $1 sample json, $2 dir, $3 realdir
+  jq -r --arg d "$2" --arg r "$3" '
+    (.children // []) as $c
+    | [ $c[] | . as $p
+        | ([$c[] | select(.pid == $p.top) | .cmd] | first // "") as $top
+        | select(($p.cmd + " " + $top) | (contains($d + "/") or contains($r + "/")))
+        | .cpuPct ] | add // 0
+  ' <<<"$1" 2>/dev/null || echo 0
+}
+
+results="[]"
+index=0
+for row in "${targets[@]}"; do
+  IFS=$'\t' read -r id name dir realdir <<<"$row"
+  index=$(( index + 1 ))
+  emit --argjson i "$index" --argjson n "$total" --arg id "$id" --arg name "$name" \
+    --argjson eta "$(( (total - index + 1) * per_plugin ))" \
+    '{type:"progress", index:$i, total:$n, id:$id, name:$name, etaSec:$eta}'
+
+  on=(); off=(); onc=(); offc=(); on_rss=0; off_rss=0; restored=true
+
+  s="$(take)"
+  pct="$(jq -r '.cpuPct // empty' <<<"$s" 2>/dev/null)"
+  [[ -n "$pct" ]] || { say warning "sampling failed before $id: $(jq -r '.error // "?"' <<<"$s" 2>/dev/null)"; continue; }
+  on+=("$pct"); onc+=("$(child_pct "$s" "$dir" "$realdir")")
+  on_rss="$(jq -r '.rssKb + .childrenRssKb' <<<"$s")"
+  ref="$pct"
+
+  for (( r = 1; r <= rounds; r++ )); do
+    current="$id"; write_journal "$id"
+    if ! omarchy plugin disable "$id" >/dev/null 2>&1; then
+      current=""; write_journal ""
+      say warning "could not disable $id; skipped"
+      break
+    fi
+    wait_enabled "$id" false || say warning "$id still reports enabled after disable"
+    cp "$config" "$state/expected-off.json"
+    quiet "$ref" || true
+    s="$(take)"
+    pct="$(jq -r '.cpuPct // empty' <<<"$s" 2>/dev/null)"
+    [[ -n "$pct" ]] && { off+=("$pct"); offc+=("$(child_pct "$s" "$dir" "$realdir")"); off_rss="$(jq -r '.rssKb + .childrenRssKb' <<<"$s")"; }
+
+    if same_config "$config" "$state/expected-off.json"; then
+      write_config "$snapshot"
+    else
+      # Something else wrote shell.json while this plugin was off (Settings,
+      # a drag in the bar, another tool). Put back only this plugin and keep
+      # that change -- and make it part of the snapshot so later rounds
+      # don't undo it either.
+      say warning "shell.json was changed during the audit; kept that change and put $id back in its slot"
+      targeted_restore "$id" "$snapshot"
+      external_edit=1
+    fi
+    if wait_enabled "$id" true; then
+      if (( ${external_edit:-0} )); then cp "$config" "$snapshot"; external_edit=0; fi
+      current=""; write_journal ""
+    else
+      restored=false
+      say warning "$id did not come back after restoring shell.json; left in the journal for recovery"
+      break
+    fi
+    quiet "$ref" || say warning "$id: shell did not settle within ${settle_max}s after re-enable; sample may be noisy"
+    s="$(take)"
+    pct="$(jq -r '.cpuPct // empty' <<<"$s" 2>/dev/null)"
+    [[ -n "$pct" ]] && { on+=("$pct"); onc+=("$(child_pct "$s" "$dir" "$realdir")"); }
+  done
+
+  [[ "$restored" == true ]] || break
+
+  results="$(jq -c --arg id "$id" --arg name "$name" \
+    --arg on "${on[*]}" --arg off "${off[*]}" --arg onc "${onc[*]}" --arg offc "${offc[*]}" \
+    --argjson onRss "${on_rss:-0}" --argjson offRss "${off_rss:-0}" --argjson restored "$restored" '
+    def nums: split(" ") | map(select(length > 0) | tonumber);
+    . + [{id:$id, name:$name, on:($on|nums), off:($off|nums), onChild:($onc|nums), offChild:($offc|nums),
+          onRssKb:$onRss, offRssKb:$offRss, restored:$restored}]' <<<"$results")"
+done
+
+out="$(jq -c --argjson ranAt "$(( ${EPOCHREALTIME/./} / 1000 ))" --argjson rounds "$rounds" \
+  --argjson sampleSec "$sample" \
+  '{type:"result", ranAt:$ranAt, rounds:$rounds, sampleSec:$sampleSec, results:.}' <<<"$results")"
+if [[ -z "$only" ]]; then
+  printf '%s\n' "$out" > "$last.tmp" && mv -f "$last.tmp" "$last"
+fi
+printf '%s\n' "$out"

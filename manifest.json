@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "renardoberou.plugin-tax",
   "name": "Plugin Tax",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Bernardo Roustand",
   "license": "MIT",
   "description": "Tracks the Omarchy shell's own CPU headroom and, on demand, audits every enabled third-party plugin by disabling each one in turn and measuring the CPU/RSS it was costing at idle.",

@@ -18,6 +18,12 @@ BarWidget {
   readonly property var auditResults: svc ? svc.auditResults : []
   readonly property string auditSummary: svc ? svc.auditSummary : ""
   readonly property var disabledIds: svc ? svc.disabledIds : []
+  readonly property var pendingIds: svc ? svc.pendingIds : []
+  readonly property string notice: svc ? svc.notice : ""
+  readonly property var warnings: svc ? svc.auditWarnings : []
+  readonly property color fg: root.bar ? root.bar.foreground : Color.foreground
+  readonly property color urgentColor: root.bar ? root.bar.urgent : Color.urgent
+  readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
 
   property bool popupOpen: false
   function close() { popupOpen = false }
@@ -33,8 +39,8 @@ BarWidget {
     Text {
       textFormat: Text.PlainText
       text: root.alerting ? "⚡" : "󰾆"
-      color: root.alerting ? (root.bar ? root.bar.urgent : Color.urgent) : root.bar.barForeground
-      font.family: root.bar.fontFamily
+      color: root.alerting ? root.urgentColor : (root.bar ? root.bar.barForeground : Color.foreground)
+      font.family: root.fontFamily
       font.pixelSize: Style.font.body
       anchors.verticalCenter: parent.verticalCenter
     }
@@ -42,9 +48,9 @@ BarWidget {
     Text {
       textFormat: Text.PlainText
       text: root.label
-      visible: !root.bar.vertical
-      color: root.alerting ? (root.bar ? root.bar.urgent : Color.urgent) : root.bar.barForeground
-      font.family: root.bar.fontFamily
+      visible: !(root.bar && root.bar.vertical)
+      color: root.alerting ? root.urgentColor : (root.bar ? root.bar.barForeground : Color.foreground)
+      font.family: root.fontFamily
       font.pixelSize: Style.font.body
       anchors.verticalCenter: parent.verticalCenter
     }
@@ -76,39 +82,70 @@ BarWidget {
       PanelHero {
         title: "Plugin Tax"
         meta: root.tip
-        foreground: root.bar ? root.bar.foreground : Color.foreground
-        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+        foreground: root.fg
+        fontFamily: root.fontFamily
         iconComponent: Component {
           Rectangle {
             width: Style.space(14)
             height: Style.space(14)
             radius: width / 2
             anchors.verticalCenter: parent.verticalCenter
-            color: root.alerting ? (root.bar ? root.bar.urgent : Color.urgent) : "#5fd68a"
+            color: root.alerting ? root.urgentColor : root.fg
+            opacity: root.alerting ? 1.0 : 0.45
           }
         }
       }
 
-      PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
+      Text {
+        width: parent.width
+        visible: root.notice !== ""
+        text: root.notice
+        wrapMode: Text.Wrap
+        color: root.urgentColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      PanelSeparator { foreground: root.fg }
 
       Button {
         width: parent.width
-        text: root.auditing ? "Auditing… (blinks each plugin off briefly)" : "Run audit"
+        text: root.auditing ? (svc ? svc.progressText : "Auditing…") : "Run audit"
         enabled: !root.auditing
         bordered: true
-        foreground: root.bar ? root.bar.foreground : Color.foreground
+        foreground: root.fg
         horizontalPadding: Style.spacing.controlPaddingX
         verticalPadding: Style.spacing.controlPaddingY
-        onClicked: if (svc) svc.runAudit()
+        onClicked: if (svc) svc.runAudit("")
+      }
+
+      Text {
+        width: parent.width
+        visible: root.auditing
+        text: "Each plugin blinks off for a few seconds and comes back where it was. Leave the shell settings alone until it finishes."
+        wrapMode: Text.Wrap
+        color: Qt.darker(root.fg, 1.5)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Text {
+        width: parent.width
+        visible: root.warnings.length > 0
+        text: root.warnings.length === 1 ? root.warnings[0] : root.warnings.length + " warnings — latest: " + root.warnings[root.warnings.length - 1]
+        wrapMode: Text.Wrap
+        color: root.urgentColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
       }
 
       Text {
         width: parent.width
         visible: root.auditResults.length > 0
-        text: root.auditSummary
+        text: root.auditSummary + (svc && svc.auditRanAt ? " · " + Qt.formatDateTime(new Date(svc.auditRanAt), "ddd HH:mm") : "")
         wrapMode: Text.Wrap
         color: root.bar ? Qt.darker(root.bar.foreground, 1.3) : Color.muted
-        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
       }
 
@@ -118,7 +155,7 @@ BarWidget {
         text: "No third-party plugins to audit, or it hasn't run yet."
         wrapMode: Text.Wrap
         color: root.bar ? Qt.darker(root.bar.foreground, 1.5) : Color.muted
-        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+        font.family: root.fontFamily
         font.pixelSize: Style.font.caption
       }
 
@@ -146,14 +183,15 @@ BarWidget {
           spacing: Style.space(8)
 
           readonly property bool isOff: root.disabledIds.indexOf(modelData.id) >= 0
+          readonly property bool isPending: root.pendingIds.indexOf(modelData.id) >= 0
 
           Rectangle {
             width: Style.space(8)
             height: Style.space(8)
             radius: width / 2
             anchors.verticalCenter: parent.verticalCenter
-            color: modelData.flagged ? (root.bar ? root.bar.urgent : Color.urgent) : "#5fd68a"
-            opacity: rowItem.isOff ? 0.35 : 1.0
+            color: modelData.verdict === "flagged" || modelData.verdict === "minor" ? root.urgentColor : root.fg
+            opacity: rowItem.isOff ? 0.25 : (modelData.verdict === "flagged" ? 1.0 : modelData.verdict === "minor" ? 0.6 : 0.35)
           }
 
           Column {
@@ -166,32 +204,36 @@ BarWidget {
               text: modelData.name || modelData.id
               elide: Text.ElideRight
               width: parent.width
-              color: root.bar ? root.bar.foreground : Color.foreground
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              color: root.fg
+              font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               opacity: rowItem.isOff ? 0.5 : 1.0
             }
 
             Text {
               textFormat: Text.PlainText
-              text: (modelData.deltaPct >= 0 ? "+" : "") + Number(modelData.deltaPct).toFixed(1) +
-                "% cpu idle" + (rowItem.isOff ? " · disabled" : "")
-              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              text: Model.formatCost(modelData) + (rowItem.isOff ? " · disabled" : "")
+              width: parent.width
+              elide: Text.ElideRight
+              color: Qt.darker(root.fg, 1.4)
+              font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
           }
 
           Button {
             anchors.verticalCenter: parent.verticalCenter
-            text: rowItem.isOff ? "Off" : "Disable"
-            enabled: !rowItem.isOff
+            text: rowItem.isPending ? "…" : (rowItem.isOff ? "Re-enable" : "Disable")
+            enabled: !rowItem.isPending && !root.auditing
             bordered: true
-            foreground: root.bar ? root.bar.foreground : Color.foreground
+            foreground: root.fg
             horizontalPadding: Style.spacing.controlPaddingX
             verticalPadding: Style.spacing.controlPaddingY
             fontSize: Style.font.caption
-            onClicked: if (svc) svc.disablePlugin(modelData.id)
+            onClicked: if (svc) {
+              if (rowItem.isOff) svc.reenablePlugin(modelData.id)
+              else svc.disablePlugin(modelData.id)
+            }
           }
         }
       }

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# burn [duty 0..1] -- spins one core at roughly the given duty cycle.
+# Test fixture for Plugin Tax: a stand-in for a plugin helper daemon.
+duty="${1:-1}"
+on="$(awk -v d="$duty" 'BEGIN{printf "%.3f", d*0.1}')"
+off="$(awk -v d="$duty" 'BEGIN{printf "%.3f", (1-d)*0.1}')"
+if [[ "$duty" == 1 ]]; then while :; do :; done; fi
+while :; do
+  timeout "$on" bash -c 'while :; do :; done'
+  sleep "$off"
+done

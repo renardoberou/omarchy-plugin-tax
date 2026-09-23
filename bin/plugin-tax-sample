@@ -1,53 +1,273 @@
 #!/usr/bin/env bash
-# Reports current CPU% and RSS for the Omarchy shell process, using the same
-# two-snapshot method as `top -bn2`: read /proc/[pid]/stat, sleep, read again,
-# diff the tick counts. Invoked as a direct child of quickshell via
-# Quickshell.Io.Process (array-form command, no intermediate shell), so
-# $PPID is the shell's own PID — no PID discovery needed.
+# One CPU/RSS sample of the Omarchy shell AND every live process under it.
 #
-# Usage: plugin-tax-sample [interval_seconds]
-#   Prints one JSON line:
-#     {"pid":N,"comm":"quickshell","cpuPct":F,"rssKb":N}
-#   or {"error":"pid-gone"} if the process disappeared mid-sample.
+# Why the whole tree: plugins that do real work usually do it in helper
+# processes (wl-paste watchers, python daemons, `... --follow` streams), not
+# in QML. A child's CPU only reaches the parent's cutime/cstime when the
+# child exits, so reading the shell's own /proc/PID/stat is blind to a
+# daemon that has been burning a core for an hour. Instead this takes two
+# snapshots of /proc and diffs every descendant individually.
+#
+# Usage: plugin-tax-sample [--pid N] [--interval S] [--slices N] [--exclude PID]...
+#                          [--ignore-cmd REGEX] [--ignore-reaped] [--any-comm]
+#   --pid       process to measure (default: $PPID, i.e. the quickshell that
+#               launched us via Quickshell.Io.Process)
+#   --interval  seconds between snapshots (default 1.2)
+#   --exclude   leave this PID's whole subtree out (repeatable). Our own
+#               PID is always excluded, so the sampler never measures itself;
+#               the audit passes its own PID so its CLI calls don't count.
+#   --slices    split the window into N equal slices and report the MEDIAN
+#               slice as cpuPct (default 1 = plain mean). Every shell.json
+#               write makes the shell re-apply config and restart first-party
+#               helpers, which costs uneven multi-second bursts; a plugin's
+#               steady cost shows in every slice, a burst only in some. The
+#               audit uses this; the pill does not need it.
+#   --ignore-cmd  prune direct children of the shell whose command line
+#               matches REGEX (bash =~), with their subtrees. The audit uses it
+#               for Omarchy's own tooling: every shell.json write makes
+#               first-party plugins refresh (omarchy-agent-usage -> codex,
+#               omarchy-network, ...) -- seconds of CPU that belong to the
+#               reload, not to the plugin being toggled.
+#   --ignore-reaped  don't count children that were born and reaped inside
+#               the window (their origin can't be attributed once dead).
+#   --any-comm  skip the "is this really quickshell?" check (tests only)
+#
+# Prints one JSON line:
+#   {"pid":N,"comm":"quickshell","intervalSec":F,
+#    "cpuPct":F,          shell + all descendants (median slice if --slices)
+#    "meanPct":F,         shell + all descendants over the whole window
+#    "slicesPct":[F..],   per-slice totals (only with --slices > 1)
+#    "shellPct":F,        the shell process itself (all threads)
+#    "childrenPct":F,     live descendants + children reaped mid-window
+#    "rssKb":N, "childrenRssKb":N,
+#    "children":[{"pid","ppid","top","comm","cmd","cpuPct","rssKb"}]}
+#   `top` is the ancestor directly under the shell, for attribution.
+# or {"error":"pid-gone"|"wrong-process","pid":N,"comm":"..."}.
 set -uo pipefail
 
-interval="${1:-1.2}"
 pid="$PPID"
-clk_tck="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+interval="1.2"
+slices=1
+ignore_re=""
+ignore_reaped=0
+any_comm=0
+excludes=("$$")
 
-read_ticks() {
-  local stat rest
-  stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
-  # comm (field 2) is the only field that can contain spaces/parens, and it's
-  # always wrapped in the LAST matching "(...)" — split there, then the
-  # remaining fields are space-separated and fixed-width from field 3 on.
-  rest="${stat##*) }"
-  # fields after comm, 1-indexed from field 3: state pid... utime(14) stime(15)
-  # cutime(16) cstime(17) relative to the ORIGINAL line, i.e. index 12/13/14/15
-  # (1-indexed) of $rest.
-  read -r _state _ppid _pgrp _session _tty _tpgid _flags _minflt _cminflt _majflt _cmajflt \
-    utime stime cutime cstime _rest <<<"$rest"
-  [[ -n "${utime:-}" && -n "${stime:-}" ]] || return 1
-  echo "$(( utime + stime + ${cutime:-0} + ${cstime:-0} ))"
-}
+need() { (( $2 >= 2 )) || { echo "plugin-tax-sample: $1 needs a value" >&2; exit 2; }; }
+while (( $# > 0 )); do
+  case "$1" in
+    --pid) need "$1" $#; pid="$2"; shift 2 ;;
+    --interval) need "$1" $#; interval="$2"; shift 2 ;;
+    --slices) need "$1" $#; slices="$2"; shift 2 ;;
+    --ignore-cmd) need "$1" $#; ignore_re="$2"; shift 2 ;;
+    --ignore-reaped) ignore_reaped=1; shift ;;
+    --exclude) need "$1" $#; [[ -n "$2" ]] && excludes+=("$2"); shift 2 ;;
+    --any-comm) any_comm=1; shift ;;
+    # Back-compat with v0.1's positional form: plugin-tax-sample 1.2
+    [0-9]*) interval="$1"; shift ;;
+    *) echo "plugin-tax-sample: unknown option: $1" >&2; exit 2 ;;
+  esac
+done
 
-if [[ ! -d "/proc/$pid" ]]; then
-  echo '{"error":"pid-gone"}'
-  exit 0
+err() { printf '{"error":"%s","pid":%d,"comm":"%s"}\n' "$1" "${pid:-0}" "${2//\"/}"; exit 0; }
+
+[[ "$pid" =~ ^[0-9]+$ && -d "/proc/$pid" ]] || err pid-gone ""
+comm=""; { read -r comm < "/proc/$pid/comm"; } 2>/dev/null || true
+[[ -n "$comm" ]] || err pid-gone ""
+# v0.1 measured the wrong process for months because nothing checked this.
+if (( ! any_comm )) && [[ "$comm" != "quickshell" && "$comm" != "qs" ]]; then
+  err wrong-process "$comm"
 fi
 
-comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo "")"
+# CLK_TCK is 100 and pages are 4 KiB on every Linux target Omarchy runs on;
+# overridable for the odd kernel rather than paying two forks per sample.
+clk_tck="${PLUGIN_TAX_CLK_TCK:-100}"
+page_kb="${PLUGIN_TAX_PAGE_KB:-4}"
 
-t0="$(read_ticks)" || { echo '{"error":"pid-gone"}'; exit 0; }
-sleep "$interval"
-t1="$(read_ticks)" || { echo '{"error":"pid-gone"}'; exit 0; }
+declare -A excluded_set=()
+for e in "${excludes[@]}"; do excluded_set[$e]=1; done
 
-rss_kb="$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)"
-[[ -n "$rss_kb" ]] || rss_kb=0
+# The shell's live tree, via /proc/PID/task/TID/children (bash builtins only
+# -- scanning all of /proc cost ~100ms CPU per sample, which is a lot for a
+# tool whose job is to find CPU waste). Excluded subtrees are pruned here.
+# (Runs inside the snapshot's process substitution, so the cache lives for
+# one snapshot -- a few cmdline reads of the shell's direct children.)
+declare -A ignore_cache=()
+ignored_top() {
+  local kid="$1" argv=() kcomm=""
+  if [[ -z "${ignore_cache[$kid]:-}" ]]; then
+    { mapfile -d '' -t argv < "/proc/$kid/cmdline"; } 2>/dev/null || true
+    # comm survives into zombie state (cmdline goes empty), so match it too.
+    { read -r kcomm < "/proc/$kid/comm"; } 2>/dev/null || true
+    argv=("${argv[@]}" "$kcomm")
+    # Anything living in the third-party plugins folder is exactly what we
+    # are here to measure -- never prune it, whatever its name looks like
+    # (omarchy-help-daemon, plugins/omarchy-keycaps/...).
+    if [[ "${argv[*]}" == *"/.config/omarchy/plugins/"* ]]; then ignore_cache[$kid]=n
+    elif [[ "${argv[*]}" =~ $ignore_re ]]; then ignore_cache[$kid]=y
+    else ignore_cache[$kid]=n; fi
+  fi
+  [[ "${ignore_cache[$kid]}" == y ]]
+}
 
-delta=$(( t1 - t0 ))
-cpu_pct="$(awk -v d="$delta" -v tck="$clk_tck" -v iv="$interval" \
-  'BEGIN{ if (iv <= 0) iv = 1; printf "%.2f", (d/tck)/iv*100 }')"
+tree_stat_files() {
+  local queue=("$pid") p f kid
+  local -a kids
+  while (( ${#queue[@]} )); do
+    p="${queue[0]}"; queue=("${queue[@]:1}")
+    printf '/proc/%s/stat\n' "$p"
+    for f in /proc/"$p"/task/*/children; do
+      [[ -r "$f" ]] || continue
+      read -r -a kids < "$f" || true
+      for kid in "${kids[@]}"; do
+        [[ -n "${excluded_set[$kid]:-}" ]] && continue
+        if [[ -n "$ignore_re" && "$p" == "$pid" ]] && ignored_top "$kid"; then
+          excluded_set[$kid]=1   # also keeps it out of the reaped arithmetic
+          continue
+        fi
+        queue+=("$kid")
+      done
+    done
+  done
+}
 
-printf '{"pid":%d,"comm":"%s","cpuPct":%s,"rssKb":%s}\n' \
-  "$pid" "${comm//\"/}" "$cpu_pct" "$rss_kb"
+# One line per process: pid ppid ticks(u+s) childticks(cu+cs) rss_pages starttime comm
+# comm (field 2) may contain spaces and parens; it always ends at the LAST
+# ") ", so split there. Files that vanish between walk and read are skipped
+# (gawk treats an unreadable input file as a warning, not a failure).
+snapshot() {
+  local -a files
+  mapfile -t files < <(tree_stat_files)
+  gawk '
+    FNR == 1 {
+      line = $0
+      p = index(line, " (")
+      q = 0
+      for (i = length(line); i > 0; i--) if (substr(line, i, 2) == ") ") { q = i; break }
+      if (!p || !q) next
+      pid = substr(line, 1, p - 1)
+      comm = substr(line, p + 2, q - p - 2)
+      n = split(substr(line, q + 2), r, " ")
+      # r[k] is field k+2 of stat(5): ppid=4 utime=14 stime=15 cutime=16 cstime=17 starttime=22 rss=24
+      if (n < 22) next
+      gsub(/[\t ]/, "_", comm)
+      print pid, r[2], r[12] + r[13], r[14] + r[15], r[22], r[20], comm
+    }
+  ' "${files[@]}" 2>/dev/null
+}
+
+[[ "$slices" =~ ^[1-9][0-9]*$ ]] || slices=1
+step="$(awk -v i="$interval" -v n="$slices" 'BEGIN{printf "%.3f", i/n}')"
+# Each snapshot also records /proc/uptime at its start: a process that is
+# in snapshot k+1 but not in k only counts if it STARTED after snapshot k.
+# Otherwise it existed already but was outside the walk (reparented, or
+# pruned in one snapshot and not the next), and counting its whole lifetime
+# would fake a spike -- v0.2's first draft reported 245% that way.
+snaps=(); stamps=(); ups=()
+take_snap() {
+  local up _
+  read -r up _ < /proc/uptime
+  ups+=("$up"); snaps+=("$(snapshot)"); stamps+=("${EPOCHREALTIME/./}")
+}
+take_snap
+for (( k = 0; k < slices; k++ )); do
+  sleep "$step"
+  take_snap
+done
+s0="${snaps[0]}"; s1="${snaps[$slices]}"
+n0="${stamps[0]}"; n1="${stamps[$slices]}"
+
+[[ -d "/proc/$pid" ]] || err pid-gone "$comm"
+
+# Diff two snapshots over the shell's descendant tree.
+diff_snaps() {  # $1 snap0 $2 snap1 $3 elapsed_us $4 uptime at snap0
+  gawk -v root="$pid" -v tck="$clk_tck" -v pagekb="$page_kb" -v up0="$4" \
+       -v elapsed_us="$3" -v excl="${!excluded_set[*]}" -v noreaped="$ignore_reaped" '
+    BEGIN {
+      split(excl, ex, " "); for (i in ex) excluded[ex[i]] = 1
+      secs = elapsed_us / 1e6; if (secs <= 0) secs = 1
+    }
+    # Pass 1: snapshot 0
+    FNR == NR { pp0[$1] = $2; t0[$1] = $3; c0[$1] = $4; next }
+    # Pass 2: snapshot 1
+    { pp1[$1] = $2; t1[$1] = $3; c1[$1] = $4; rss1[$1] = $5; st1[$1] = $6; comm1[$1] = $7 }
+    function topOf(p, pp,    guard, prev) {
+      # Walk up to the ancestor whose parent is root. "" if not a descendant
+      # or if any ancestor (or p itself) is excluded.
+      guard = 0
+      while (p != "" && p != root && guard++ < 64) {
+        if (p in excluded) return ""
+        prev = p
+        p = pp[p]
+        if (p == root) return prev
+      }
+      return ""
+    }
+    END {
+      if (!(root in t1) || !(root in t0)) { print "GONE"; exit }
+      shell = t1[root] - t0[root]
+      # Children reaped during the window land in root cutime/cstime with
+      # their whole lifetime. Subtract what dead direct children had already
+      # used at snapshot 0 so a long-lived daemon exiting does not look like
+      # a spike -- the remainder is short-lived work done inside the window.
+      reaped = c1[root] - c0[root]
+      for (p in t0) {
+        if (pp0[p] == root && !(p in t1) && !(p in excluded)) reaped -= t0[p] + c0[p]
+      }
+      if (reaped < 0 || noreaped) reaped = 0
+
+      kids = reaped; kidsRss = 0
+      for (p in t1) {
+        if (p == root) continue
+        top = topOf(p, pp1)
+        if (top == "") continue
+        if (p in t0) used = (t1[p] + c1[p]) - (t0[p] + c0[p])
+        else if (st1[p] / tck >= up0 - 0.02) used = t1[p] + c1[p]   # born in the window
+        else used = 0                                               # no baseline
+        if (used < 0) used = 0
+        kids += used; kidsRss += rss1[p]
+        printf "CHILD\t%s\t%s\t%s\t%s\t%.2f\t%d\n", p, pp1[p], top, comm1[p], used / tck / secs * 100, rss1[p] * pagekb
+      }
+      printf "TOTAL\t%.2f\t%.2f\t%.2f\t%d\t%d\t%.3f\n", \
+        (shell + kids) / tck / secs * 100, shell / tck / secs * 100, kids / tck / secs * 100, \
+        rss1[root] * pagekb, kidsRss * pagekb, secs
+    }
+  ' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
+}
+
+report="$(diff_snaps "$s0" "$s1" "$(( n1 - n0 ))" "${ups[0]}")"
+
+slice_pcts=()
+if (( slices > 1 )); then
+  for (( k = 0; k < slices; k++ )); do
+    t="$(diff_snaps "${snaps[$k]}" "${snaps[$((k + 1))]}" "$(( stamps[k + 1] - stamps[k] ))" "${ups[$k]}" | grep '^TOTAL' | cut -f2)"
+    [[ -n "$t" ]] && slice_pcts+=("$t")
+  done
+fi
+
+[[ "$report" != GONE* && -n "$report" ]] || err pid-gone "$comm"
+
+# Attach each child's command line (what the audit attributes by) and emit JSON.
+children_tsv=""
+while IFS=$'\t' read -r tag cpid cppid ctop ccomm cpct crss; do
+  [[ "$tag" == CHILD ]] || continue
+  argv=(); { mapfile -d '' -t argv < "/proc/$cpid/cmdline"; } 2>/dev/null || true
+  cmd="${argv[*]}"; cmd="${cmd//$'\t'/ }"; cmd="${cmd//$'\n'/ }"; cmd="${cmd:0:400}"
+  children_tsv+="$cpid"$'\t'"$cppid"$'\t'"$ctop"$'\t'"$ccomm"$'\t'"${cmd% }"$'\t'"$cpct"$'\t'"$crss"$'\n'
+done <<<"$report"
+
+IFS=$'\t' read -r _ cpu shellp kidsp rss kidsrss secs < <(grep '^TOTAL' <<<"$report")
+
+printf '%s' "$children_tsv" | jq -Rsc \
+  --argjson pid "$pid" --arg comm "$comm" --argjson secs "$secs" --arg slices "${slice_pcts[*]}" \
+  --argjson cpu "$cpu" --argjson shellp "$shellp" --argjson kidsp "$kidsp" \
+  --argjson rss "$rss" --argjson kidsrss "$kidsrss" '
+  ($slices | split(" ") | map(select(length > 0) | tonumber)) as $sl
+  | {pid: $pid, comm: $comm, intervalSec: $secs,
+   cpuPct: (if ($sl | length) > 1 then ($sl | sort | if length % 2 == 1 then .[length / 2 | floor] else (.[length / 2 - 1] + .[length / 2]) / 2 end) else $cpu end),
+   meanPct: $cpu, slicesPct: $sl, shellPct: $shellp, childrenPct: $kidsp,
+   rssKb: $rss, childrenRssKb: $kidsrss,
+   children: [split("\n")[] | select(length > 0) | split("\t")
+              | {pid: (.[0]|tonumber), ppid: (.[1]|tonumber), top: (.[2]|tonumber),
+                 comm: .[3], cmd: .[4], cpuPct: (.[5]|tonumber), rssKb: (.[6]|tonumber)}]
+             | sort_by(-.cpuPct)}'

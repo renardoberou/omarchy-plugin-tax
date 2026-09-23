@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "plugintax-test.burn-child",
+  "name": "Plugin Tax test: burning helper",
+  "version": "0.0.1",
+  "author": "Bernardo Roustand",
+  "license": "MIT",
+  "description": "Test fixture: runs a helper process at ~15% CPU. Used by .dev/e2e.sh only.",
+  "kinds": ["service"],
+  "entryPoints": { "service": "Service.qml" }
+}

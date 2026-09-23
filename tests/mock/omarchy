@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Mock omarchy CLI for tests/audit.test.sh. Mirrors the real registry's
+# behaviour that matters here: disable splices the widget's layout entry out,
+# enable re-inserts a bare {id} at the end of "right" (placement/settings lost).
+cfg="$PLUGIN_TAX_CONFIG"
+[[ "$1" == plugin ]] || exit 1
+case "$2" in
+  list)
+    jq -c --argjson ids "$(cat "$MOCK_IDS")" '
+      [(.bar.layout // {}) | .[] | .[] | .id] as $placed
+      | [$ids[] | {id: ., name: ., kinds: ["bar-widget"], firstParty: false,
+                   enabled: (. as $i | ($placed | index($i)) != null)}]' "$cfg" ;;
+  disable)
+    jq --arg id "$3" '.bar.layout |= map_values(map(select(.id != $id)))' "$cfg" > "$cfg.t" && mv "$cfg.t" "$cfg"
+    # Simulate someone editing shell.json while the audit has $3 off.
+    if [[ "${MOCK_EDIT_ON_DISABLE:-}" == "$3" && ! -e "$cfg.edited" ]]; then
+      touch "$cfg.edited"
+      ( sleep 0.3; jq '.idle = {lock: 7} | .bar.layout.right |= reverse' "$cfg" > "$cfg.e" && mv "$cfg.e" "$cfg" ) &
+    fi
+    echo "Disabled $3" ;;
+  enable)
+    jq --arg id "$3" '.bar.layout.right += [{id: $id}]' "$cfg" > "$cfg.t" && mv "$cfg.t" "$cfg" ;;
+  *) exit 1 ;;
+esac

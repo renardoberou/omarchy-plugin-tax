@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "plugintax-test.burn-qml",
+  "name": "Plugin Tax test: burning QML",
+  "version": "0.0.1",
+  "author": "Bernardo Roustand",
+  "license": "MIT",
+  "description": "Test fixture: busy-loops ~12% on the shell's main thread. Used by .dev/e2e.sh only.",
+  "kinds": ["service"],
+  "entryPoints": { "service": "Service.qml" }
+}
