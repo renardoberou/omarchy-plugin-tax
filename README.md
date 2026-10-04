@@ -1,6 +1,6 @@
 # Plugin Tax
 
-![Plugin Tax panel: shell CPU, Run audit, per-plugin results](preview.png)
+![Plugin Tax: speedometer dial on the bar, and its panel with shell CPU, Run audit, per-plugin results](preview.png)
 
 An Omarchy shell plugin that watches the shell's own idle CPU headroom and,
 on demand, finds out which enabled third-party plugin is spending it.
