@@ -32,6 +32,17 @@ test("alerting needs sustained excess over baseline", () => {
   assert.equal(M.isAlerting(h, 8, 2), true)
 })
 
+test("dial: needle reaches the redline exactly at the alert line", () => {
+  const at = (cpus) => cpus.map((c, i) => ({ t: i, cpuPct: c }))
+  assert.equal(M.dialFraction([], 8), 0)
+  assert.equal(M.dialFraction(at([0, 0, 0]), 8), 0)
+  // usual 2% + threshold 8% = alert at 10%
+  const usual = [2, 2, 2, 2, 2, 2, 2, 2, 2]
+  assert.ok(Math.abs(M.dialFraction(at(usual.concat([10])), 8) - M.DIAL_REDLINE) < 1e-9)
+  assert.ok(M.dialFraction(at(usual.concat([5])), 8) < M.DIAL_REDLINE)
+  assert.equal(M.dialFraction(at(usual.concat([500])), 8), 1, "pegged, not past the stop")
+})
+
 test("analyze: interleaved rounds, flagged when every round agrees", () => {
   const r = M.analyze({ id: "a", on: [10, 10.4, 9.8], off: [2, 2.2], onChild: [0, 0, 0] }, 3)
   assert.equal(r.verdict, "flagged")

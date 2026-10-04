@@ -37,7 +37,8 @@ Item {
   property double quietUntil: 0
   property string sampleError: ""
   readonly property bool alerting: Model.isAlerting(history, alertThresholdPct, sustainSamples)
-  readonly property string pillText: Model.formatPill(history, alerting)
+  readonly property real dialFraction: Model.dialFraction(history, alertThresholdPct)
+  readonly property real dialRedline: Model.DIAL_REDLINE
   readonly property string tooltip: Model.tooltipText(history, alerting, sampleError)
 
   property bool auditing: false

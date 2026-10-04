@@ -12,7 +12,7 @@ BarWidget {
   readonly property var svc: bar && bar.shell ? bar.shell.serviceFor("renardoberou.plugin-tax") : null
   readonly property var history: svc ? svc.history : []
   readonly property bool alerting: svc ? svc.alerting : false
-  readonly property string label: svc ? svc.pillText : "Plugin Tax"
+  readonly property bool live: svc ? root.history.length > 0 && svc.sampleError === "" : false
   readonly property string tip: svc ? svc.tooltip : "Plugin Tax — starting…"
   readonly property bool auditing: svc ? svc.auditing : false
   readonly property var auditResults: svc ? svc.auditResults : []
@@ -26,34 +26,25 @@ BarWidget {
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
 
   property bool popupOpen: false
+  readonly property bool opened: popupOpen
+  function open() { popupOpen = true }
   function close() { popupOpen = false }
 
-  implicitWidth: pillRow.implicitWidth + Style.space(14)
-  implicitHeight: barSize
+  implicitWidth: vertical ? barSize : dial.width + Style.space(12)
+  implicitHeight: vertical ? dial.height + Style.space(12) : barSize
 
-  Row {
-    id: pillRow
+  Gauge {
+    id: dial
     anchors.centerIn: parent
-    spacing: Style.space(4)
-
-    Text {
-      textFormat: Text.PlainText
-      text: root.alerting ? "⚡" : "󰾆"
-      color: root.alerting ? root.urgentColor : (root.bar ? root.bar.barForeground : Color.foreground)
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.body
-      anchors.verticalCenter: parent.verticalCenter
-    }
-
-    Text {
-      textFormat: Text.PlainText
-      text: root.label
-      visible: !(root.bar && root.bar.vertical)
-      color: root.alerting ? root.urgentColor : (root.bar ? root.bar.barForeground : Color.foreground)
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.body
-      anchors.verticalCenter: parent.verticalCenter
-    }
+    diameter: Math.max(16, root.barSize - 4)
+    compact: true
+    fraction: svc ? svc.dialFraction : 0
+    redlineFraction: svc ? svc.dialRedline : 0.75
+    hot: root.alerting
+    live: root.live
+    foreground: root.bar ? root.bar.barForeground : Color.foreground
+    urgent: root.urgentColor
+    fontFamily: root.fontFamily
   }
 
   MouseArea {

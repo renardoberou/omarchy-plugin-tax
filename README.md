@@ -19,11 +19,12 @@ by hand.
 
 ## What it does
 
-- **Bar pill (continuous, cheap):** every 20s, samples the shell **and every
+- **Bar dial (continuous, cheap):** every 20s, samples the shell **and every
   live process under it** — plugin helper daemons included — over a 1.2s
-  window. The tooltip splits it: shell itself, helpers (naming the busiest
-  one), and the "usual" level (20th percentile of the last 30 min). The pill
-  turns urgent when two samples in a row sit 8%+ above usual. One sample
+  window, and shows it as a small analog speedometer. The tooltip splits it:
+  shell itself, helpers (naming the busiest one), and the "usual" level
+  (20th percentile of the last 30 min). The dial's red zone starts at
+  usual + 8%; the needle turns urgent when two samples in a row sit there. One sample
   costs about 50 ms of CPU (≈0.25% of a core at this interval).
 - **Run audit (on demand):** for each enabled, third-party, non-`bar`-kind
   plugin, runs interleaved rounds — ON, OFF, ON, OFF, ON by default — and

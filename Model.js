@@ -85,10 +85,18 @@ function isAlerting(history, thresholdPct, sustainCount) {
   return true
 }
 
-function formatPill(history, alerting) {
-  if (!history || !history.length) return "Plugin Tax"
+// The bar dial has no fixed 0-100% scale: an idle shell sits near 0% of a
+// core and would never lift the needle. Instead the red zone starts at the
+// alert line (usual + threshold), so the needle crosses into red exactly
+// where "above usual" begins.
+var DIAL_REDLINE = 0.75
+
+function dialFraction(history, thresholdPct) {
+  if (!history || !history.length) return 0
+  var alertAt = (baselineOf(history) || 0) + thresholdPct
+  if (!(alertAt > 0)) return 0
   var latest = history[history.length - 1].cpuPct
-  return (alerting ? "⚠ " : "") + latest.toFixed(0) + "%"
+  return Math.max(0, Math.min(1, latest / alertAt * DIAL_REDLINE))
 }
 
 function tooltipText(history, alerting, error) {
@@ -232,7 +240,8 @@ if (typeof module !== "undefined") {
     baselineOf: baselineOf,
     headroom: headroom,
     isAlerting: isAlerting,
-    formatPill: formatPill,
+    dialFraction: dialFraction,
+    DIAL_REDLINE: DIAL_REDLINE,
     tooltipText: tooltipText,
     parseAuditLine: parseAuditLine,
     parseAudit: parseAudit,
